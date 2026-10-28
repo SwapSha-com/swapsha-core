@@ -1,4 +1,5 @@
 import { targetFee } from './TargetFee.ts';
+import * as UnifiedSighash from './blake2b/UnifiedSighash.ts';
 import { OutputType } from './consts/Enums.ts';
 import Networks from './consts/Networks.ts';
 import * as Types from './consts/Types.ts';
@@ -26,8 +27,10 @@ import * as SwapTreeSerializer from './swap/SwapTreeSerializer.ts';
 import * as TaprootUtils from './swap/TaprootUtils.ts';
 
 export type { ClaimDetails, RefundDetails };
+export type { SighashMode } from './swap/Claim.ts';
 
 export {
+  UnifiedSighash,
   Bip69,
   Musig,
   Types,

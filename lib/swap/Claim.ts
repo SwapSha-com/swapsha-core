@@ -3,6 +3,11 @@ import { concatBytes } from '@noble/hashes/utils.js';
 import { Script, SigHash, Transaction } from '@scure/btc-signer';
 import { signECDSA, signSchnorr } from '@scure/btc-signer/utils.js';
 import { OutputType } from '../Boltz.ts';
+import {
+  SIGHASH_ALL_UNIFIED,
+  UnifiedScriptType,
+  unifiedSighash,
+} from '../blake2b/UnifiedSighash.ts';
 import { Errors } from '../consts/Errors.ts';
 import {
   type ClaimDetails,
@@ -15,6 +20,14 @@ import { createControlBlock, taprootHashTree } from './TaprootUtils.ts';
 
 const LEGACY_SIGHASH = SigHash.ALL;
 const DUMMY_TAPROOT_SIGNATURE = new Uint8Array(64);
+
+/**
+ * 'legacy': the signature hashes Bitcoin has always used. Valid on both chains.
+ * 'unified': Knots SIGHASH_UNIFIED (0x21). Valid only on the BLAKE2b chain, so
+ * the transaction cannot be replayed onto the SHA-256 chain. SwapSha uses this
+ * for every BLAKE2b-side spend (D6).
+ */
+export type SighashMode = 'legacy' | 'unified';
 
 export const isRelevantTaprootOutput = (
   utxo: Pick<ClaimDetails, 'type' | 'cooperative'>,
@@ -68,7 +81,9 @@ export const constructClaimTransaction = (
   isRbf = true,
   timeoutBlockHeight?: number,
   isRefund = false,
+  sighashMode: SighashMode = 'legacy',
 ): Transaction => {
+  const unified = sighashMode === 'unified';
   validateInputs(utxos);
 
   // BIP69 lexicographical input ordering
@@ -97,18 +112,28 @@ export const constructClaimTransaction = (
     });
   }
 
+  const spentOutputs = sortedUtxos.map((out) => ({
+    script: out.script,
+    amount: out.amount,
+  }));
+
   for (const [index, utxo] of sortedUtxos.entries()) {
     switch (utxo.type) {
       case OutputType.Legacy: {
-        // biome-ignore lint/complexity/useLiteralKeys: only way to get the hash to sign for the legacy input
-        const hash = tx['preimageLegacy'](
-          index,
-          utxo.redeemScript,
-          LEGACY_SIGHASH,
-        );
+        const hash = unified
+          ? unifiedSighash(
+              tx,
+              index,
+              SIGHASH_ALL_UNIFIED,
+              spentOutputs,
+              UnifiedScriptType.Base,
+              { scriptCode: utxo.redeemScript },
+            )
+          : // biome-ignore lint/complexity/useLiteralKeys: only way to get the hash to sign for the legacy input
+            tx['preimageLegacy'](index, utxo.redeemScript, LEGACY_SIGHASH);
         tx.updateInput(index, {
           finalScriptSig: Script.encode([
-            signLegacy(hash, utxo.privateKey),
+            signLegacy(hash, utxo.privateKey, unified),
             utxo.preimage,
             utxo.redeemScript,
           ]),
@@ -142,16 +167,32 @@ export const constructClaimTransaction = (
 
       const tapLeaf = getTapLeaf(isRefund, utxo.swapTree);
 
-      const sigHash = tx.preimageWitnessV1(
-        index,
-        sortedUtxos.map((out) => out.script),
-        SigHash.DEFAULT,
-        sortedUtxos.map((out) => out.amount),
-        undefined,
-        tapLeaf.output,
-        tapLeaf.version,
-      );
-      const signature = signSchnorr(sigHash, utxo.privateKey);
+      const sigHash = unified
+        ? unifiedSighash(
+            tx,
+            index,
+            SIGHASH_ALL_UNIFIED,
+            spentOutputs,
+            UnifiedScriptType.Tapscript,
+            { leafScript: tapLeaf.output, leafVersion: tapLeaf.version },
+          )
+        : tx.preimageWitnessV1(
+            index,
+            sortedUtxos.map((out) => out.script),
+            SigHash.DEFAULT,
+            sortedUtxos.map((out) => out.amount),
+            undefined,
+            tapLeaf.output,
+            tapLeaf.version,
+          );
+      // SIGHASH_DEFAULT cannot carry the opt-in, so unified taproot
+      // signatures are always 65 bytes: the Schnorr signature plus 0x21.
+      const signature = unified
+        ? concatBytes(
+            signSchnorr(sigHash, utxo.privateKey),
+            new Uint8Array([SIGHASH_ALL_UNIFIED]),
+          )
+        : signSchnorr(sigHash, utxo.privateKey);
       const witness: Uint8Array[] = [signature];
 
       if (!isRefund) {
@@ -174,15 +215,24 @@ export const constructClaimTransaction = (
       utxo.type === OutputType.Bech32 ||
       utxo.type === OutputType.Compatibility
     ) {
-      const sigHash = tx.preimageWitnessV0(
-        index,
-        utxo.redeemScript,
-        LEGACY_SIGHASH,
-        utxo.amount,
-      );
+      const sigHash = unified
+        ? unifiedSighash(
+            tx,
+            index,
+            SIGHASH_ALL_UNIFIED,
+            spentOutputs,
+            UnifiedScriptType.WitnessV0,
+            { scriptCode: utxo.redeemScript },
+          )
+        : tx.preimageWitnessV0(
+            index,
+            utxo.redeemScript,
+            LEGACY_SIGHASH,
+            utxo.amount,
+          );
       tx.updateInput(index, {
         finalScriptWitness: [
-          signLegacy(sigHash, utxo.privateKey),
+          signLegacy(sigHash, utxo.privateKey, unified),
           utxo.preimage,
           utxo.redeemScript,
         ],
@@ -196,9 +246,10 @@ export const constructClaimTransaction = (
 export const signLegacy = (
   hash: Uint8Array,
   privateKey: Uint8Array,
+  unified = false,
 ): Uint8Array => {
   return concatBytes(
     signECDSA(hash, privateKey, true),
-    new Uint8Array([LEGACY_SIGHASH]),
+    new Uint8Array([unified ? SIGHASH_ALL_UNIFIED : LEGACY_SIGHASH]),
   );
 };

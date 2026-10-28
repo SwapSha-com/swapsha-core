@@ -1,6 +1,6 @@
 import type { Transaction } from '@scure/btc-signer';
 import type { ClaimDetails, RefundDetails } from '../consts/Types.ts';
-import { constructClaimTransaction } from './Claim.ts';
+import { type SighashMode, constructClaimTransaction } from './Claim.ts';
 
 const dummyPreimage = new Uint8Array(0);
 
@@ -12,6 +12,7 @@ const dummyPreimage = new Uint8Array(0);
  * @param timeoutBlockHeight locktime of the transaction
  * @param fee how many satoshis should be paid as fee
  * @param isRbf whether the transaction should signal full Replace-by-Fee
+ * @param sighashMode 'unified' for BLAKE2b-chain refunds (replay protected)
  */
 export const constructRefundTransaction = (
   utxos: RefundDetails[],
@@ -19,6 +20,7 @@ export const constructRefundTransaction = (
   timeoutBlockHeight: number,
   fee: bigint,
   isRbf = true,
+  sighashMode: SighashMode = 'legacy',
 ): Transaction => {
   const claimUtxos: ClaimDetails[] = [];
 
@@ -36,5 +38,6 @@ export const constructRefundTransaction = (
     isRbf,
     timeoutBlockHeight,
     true,
+    sighashMode,
   );
 };
