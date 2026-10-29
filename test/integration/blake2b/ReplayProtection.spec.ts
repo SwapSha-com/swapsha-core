@@ -14,6 +14,8 @@
  *   3. Build the claim with sighashMode 'unified' (0x21). BLAKE2b accepts it,
  *      SHA-256 rejects it with a script error: replay protected.
  *
+ * Also covers refunds, MuSig2 cooperative claims, and BLAKE2b header hashing.
+ *
  * Run: npm run test:replay
  */
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -27,9 +29,18 @@ import {
   Musig,
   Networks,
   OutputType,
+  type SighashMode,
   constructClaimTransaction,
+  constructRefundTransaction,
+  cooperativeSighash,
+  cooperativeWitness,
   detectSwap,
 } from '../../../lib/Boltz.ts';
+import {
+  blockHashHex,
+  checkProofOfWork,
+  parseBlockHeader,
+} from '../../../lib/blake2b/BlockHeader.ts';
 import type { ClaimDetails } from '../../../lib/consts/Types.ts';
 import {
   outputFunctionForType,
@@ -140,12 +151,45 @@ const fundOnBothChains = async (
   };
 };
 
-const buildUtxo = async (outputType: OutputType): Promise<ClaimDetails> => {
+type Built = {
+  utxo: ClaimDetails;
+  claimKey: Uint8Array;
+  refundKey: Uint8Array;
+};
+
+const tipHeight = async () =>
+  Math.max(
+    await sha<number>('getblockcount'),
+    await blake<number>('getblockcount'),
+  );
+
+/** Mine on whichever chain is behind until both are at least `height`. */
+const mineBothTo = async (height: number) => {
+  for (const node of [sha, blake]) {
+    const have = await node<number>('getblockcount');
+    if (have < height) {
+      await node('generatetoaddress', [
+        height - have,
+        await node<string>('getnewaddress'),
+      ]);
+    }
+  }
+};
+
+/**
+ * Fund an HTLC of `outputType` on both chains. `refundable` sets the timeout
+ * to the next block so the refund path is spendable right away.
+ */
+const buildUtxo = async (
+  outputType: OutputType,
+  refundable = false,
+): Promise<Built> => {
   const claimKey = secp256k1.utils.randomSecretKey();
   const refundKey = secp256k1.utils.randomSecretKey();
   const preimage = randomBytes(32);
-  const timeout = (await sha<number>('getblockcount')) + 100;
+  const timeout = (await tipHeight()) + (refundable ? 1 : 100);
 
+  let utxo: ClaimDetails;
   if (outputType === OutputType.Taproot) {
     const tree = swapTree(
       false,
@@ -163,33 +207,36 @@ const buildUtxo = async (outputType: OutputType): Promise<ClaimDetails> => {
       p2trOutput(tweaked.aggPubkey),
       tweaked.aggPubkey,
     );
-    return {
+    utxo = {
       ...funded,
       type: outputType,
       preimage,
-      privateKey: claimKey,
+      privateKey: refundable ? refundKey : claimKey,
       swapTree: tree,
       internalKey: musig.aggPubkey,
     } as ClaimDetails;
+  } else {
+    const redeemScript = swapScript(
+      sha256(preimage),
+      secp256k1.getPublicKey(claimKey),
+      secp256k1.getPublicKey(refundKey),
+      timeout,
+    );
+    const funded = await fundOnBothChains(
+      outputFunctionForType(outputType)!(redeemScript),
+      redeemScript,
+    );
+    utxo = {
+      ...funded,
+      type: outputType,
+      preimage,
+      privateKey: refundable ? refundKey : claimKey,
+      redeemScript,
+    } as ClaimDetails;
   }
 
-  const redeemScript = swapScript(
-    sha256(preimage),
-    secp256k1.getPublicKey(claimKey),
-    secp256k1.getPublicKey(refundKey),
-    timeout,
-  );
-  const funded = await fundOnBothChains(
-    outputFunctionForType(outputType)!(redeemScript),
-    redeemScript,
-  );
-  return {
-    ...funded,
-    type: outputType,
-    preimage,
-    privateKey: claimKey,
-    redeemScript,
-  } as ClaimDetails;
+  if (refundable) await mineBothTo(timeout);
+  return { utxo, claimKey, refundKey };
 };
 
 const accept = async (node: typeof sha, txHex: string) =>
@@ -207,28 +254,100 @@ const assertChainsSplit = async () => {
   }
 };
 
+const expectReplayProtected = async (txHex: string) => {
+  const onBlake = await accept(blake, txHex);
+  const onSha = await accept(sha, txHex);
+  expect(onBlake).toMatchObject({ allowed: true });
+  expect(onSha.allowed).toBe(false);
+  expect(onSha['reject-reason']).toMatch(/script-verify-flag-failed/);
+};
+
+const expectValidOnBoth = async (txHex: string) => {
+  expect(await accept(blake, txHex)).toMatchObject({ allowed: true });
+  expect(await accept(sha, txHex)).toMatchObject({ allowed: true });
+};
+
+const outputTypes = [
+  ['P2WSH', OutputType.Bech32],
+  ['P2SH-P2WSH', OutputType.Compatibility],
+  ['P2SH', OutputType.Legacy],
+  ['Taproot script', OutputType.Taproot],
+] as const;
+
 describe('BLAKE2b replay protection (SIGHASH_UNIFIED)', () => {
-  describe.each`
-    name                | outputType
-    ${'P2WSH'}          | ${OutputType.Bech32}
-    ${'P2SH-P2WSH'}     | ${OutputType.Compatibility}
-    ${'P2SH'}           | ${OutputType.Legacy}
-    ${'Taproot script'} | ${OutputType.Taproot}
-  `('$name HTLC claim', ({ outputType }) => {
+  beforeAll(assertChainsSplit);
+
+  describe.each(outputTypes)('%s HTLC claim', (_name, outputType) => {
     let utxo: ClaimDetails;
 
     beforeAll(async () => {
-      await assertChainsSplit();
-      utxo = await buildUtxo(outputType);
+      ({ utxo } = await buildUtxo(outputType));
     });
 
     test('legacy sighash is valid on BOTH chains (the replay hazard)', async () => {
-      const tx = constructClaimTransaction([utxo], destination, 2_000n);
-      expect((await accept(blake, tx.hex)).allowed).toBe(true);
-      expect((await accept(sha, tx.hex)).allowed).toBe(true);
+      await expectValidOnBoth(
+        constructClaimTransaction([utxo], destination, 2_000n).hex,
+      );
     });
 
     test('unified sighash is valid on BLAKE2b and rejected on SHA-256', async () => {
+      await expectReplayProtected(
+        constructClaimTransaction(
+          [utxo],
+          destination,
+          2_000n,
+          true,
+          undefined,
+          false,
+          'unified',
+        ).hex,
+      );
+    });
+  });
+
+  describe.each(outputTypes)('%s HTLC refund', (_name, outputType) => {
+    let utxo: ClaimDetails;
+    let timeout: number;
+
+    beforeAll(async () => {
+      ({ utxo } = await buildUtxo(outputType, true));
+      // nLockTime must not exceed either chain's height for the tx to be final
+      timeout = Math.min(
+        await sha<number>('getblockcount'),
+        await blake<number>('getblockcount'),
+      );
+    });
+
+    test('legacy refund is valid on BOTH chains', async () => {
+      await expectValidOnBoth(
+        constructRefundTransaction([utxo], destination, timeout, 2_000n).hex,
+      );
+    });
+
+    test('unified refund is valid on BLAKE2b and rejected on SHA-256', async () => {
+      await expectReplayProtected(
+        constructRefundTransaction(
+          [utxo],
+          destination,
+          timeout,
+          2_000n,
+          true,
+          'unified',
+        ).hex,
+      );
+    });
+  });
+
+  describe('Taproot cooperative (MuSig2 key path) claim', () => {
+    let built: Built;
+
+    beforeAll(async () => {
+      built = await buildUtxo(OutputType.Taproot);
+      built.utxo.cooperative = true;
+    });
+
+    const signCooperatively = (mode: SighashMode) => {
+      const { utxo, claimKey, refundKey } = built;
       const tx = constructClaimTransaction(
         [utxo],
         destination,
@@ -236,14 +355,97 @@ describe('BLAKE2b replay protection (SIGHASH_UNIFIED)', () => {
         true,
         undefined,
         false,
-        'unified',
+        mode,
       );
-      const onBlake = await accept(blake, tx.hex);
-      const onSha = await accept(sha, tx.hex);
+      const message = cooperativeSighash(
+        tx,
+        0,
+        [{ script: utxo.script, amount: utxo.amount }],
+        mode,
+      );
+      const publicKeys = [claimKey, refundKey].map((k) =>
+        secp256k1.getPublicKey(k),
+      );
+      const tree = utxo.swapTree!.tree;
+      const ours = tweakMusig(Musig.create(claimKey, publicKeys), tree)
+        .message(message)
+        .generateNonce();
+      const theirs = tweakMusig(Musig.create(refundKey, publicKeys), tree)
+        .message(message)
+        .generateNonce();
 
-      expect(onBlake).toMatchObject({ allowed: true });
-      expect(onSha.allowed).toBe(false);
-      expect(onSha['reject-reason']).toMatch(/script-verify-flag-failed/);
+      const oursSigned = ours
+        .aggregateNonces([[publicKeys[1], theirs.publicNonce]])
+        .initializeSession()
+        .signPartial();
+      const theirsSigned = theirs
+        .aggregateNonces([[publicKeys[0], ours.publicNonce]])
+        .initializeSession()
+        .signPartial();
+
+      const aggregated = oursSigned
+        .addPartial(publicKeys[1], theirsSigned.ourPartialSignature)
+        .aggregatePartials();
+
+      tx.updateInput(0, {
+        finalScriptWitness: cooperativeWitness(aggregated, mode),
+      });
+      return tx;
+    };
+
+    test('legacy key path is valid on BOTH chains', async () => {
+      const tx = signCooperatively('legacy');
+      expect(tx.getInput(0).finalScriptWitness![0]).toHaveLength(64);
+      await expectValidOnBoth(tx.hex);
+    });
+
+    test('unified key path (65-byte signature) is valid on BLAKE2b and rejected on SHA-256', async () => {
+      const tx = signCooperatively('unified');
+      expect(tx.getInput(0).finalScriptWitness![0]).toHaveLength(65);
+      await expectReplayProtected(tx.hex);
+    });
+  });
+
+  describe('block headers', () => {
+    const headersFrom = async (node: typeof sha, from: number, to: number) => {
+      const out: { height: number; hash: string; raw: string }[] = [];
+      for (let height = from; height <= to; height++) {
+        const hash = await node<string>('getblockhash', [height]);
+        out.push({
+          height,
+          hash,
+          raw: await node<string>('getblockheader', [hash, false]),
+        });
+      }
+      return out;
+    };
+
+    test('BLAKE2b chain: v1 before the fork, v2 from it, hashes match the node', async () => {
+      const tip = await blake<number>('getblockcount');
+      for (const { height, hash, raw } of await headersFrom(
+        blake,
+        FORK_HEIGHT - 3,
+        Math.min(tip, FORK_HEIGHT + 20),
+      )) {
+        const header = parseBlockHeader(raw);
+        expect(header.isV2).toBe(height >= FORK_HEIGHT);
+        if (header.isV2) expect(header.height).toBe(height);
+        expect(blockHashHex(header)).toBe(hash);
+        expect(checkProofOfWork(header)).toBe(true);
+      }
+    });
+
+    test('SHA-256 chain: v1 headers throughout, hashes match the node', async () => {
+      const tip = await sha<number>('getblockcount');
+      for (const { hash, raw } of await headersFrom(
+        sha,
+        FORK_HEIGHT - 3,
+        Math.min(tip, FORK_HEIGHT + 20),
+      )) {
+        const header = parseBlockHeader(raw);
+        expect(header.isV2).toBe(false);
+        expect(blockHashHex(header)).toBe(hash);
+      }
     });
   });
 });

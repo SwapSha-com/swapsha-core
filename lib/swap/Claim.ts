@@ -20,6 +20,9 @@ import { createControlBlock, taprootHashTree } from './TaprootUtils.ts';
 
 const LEGACY_SIGHASH = SigHash.ALL;
 const DUMMY_TAPROOT_SIGNATURE = new Uint8Array(64);
+// Unified key-path signatures carry the hash type byte, so the placeholder
+// must be 65 bytes or fee estimates come out one byte short per input.
+const DUMMY_TAPROOT_SIGNATURE_UNIFIED = new Uint8Array(65);
 
 /**
  * 'legacy': the signature hashes Bitcoin has always used. Valid on both chains.
@@ -155,7 +158,9 @@ export const constructClaimTransaction = (
     if (utxo.type === OutputType.Taproot) {
       if (utxo.cooperative === true) {
         tx.updateInput(index, {
-          finalScriptWitness: [DUMMY_TAPROOT_SIGNATURE],
+          finalScriptWitness: [
+            unified ? DUMMY_TAPROOT_SIGNATURE_UNIFIED : DUMMY_TAPROOT_SIGNATURE,
+          ],
         });
 
         continue;

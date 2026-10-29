@@ -1,4 +1,5 @@
 import { targetFee } from './TargetFee.ts';
+import * as BlockHeader from './blake2b/BlockHeader.ts';
 import * as UnifiedSighash from './blake2b/UnifiedSighash.ts';
 import { OutputType } from './consts/Enums.ts';
 import Networks from './consts/Networks.ts';
@@ -7,6 +8,7 @@ import type { ClaimDetails, RefundDetails } from './consts/Types.ts';
 import * as Musig from './musig/Musig.ts';
 import * as Bip69 from './swap/Bip69.ts';
 import { constructClaimTransaction } from './swap/Claim.ts';
+import { cooperativeSighash, cooperativeWitness } from './swap/Cooperative.ts';
 import { detectPreimage } from './swap/PreimageDetector.ts';
 import { constructRefundTransaction } from './swap/Refund.ts';
 import reverseSwapScript from './swap/ReverseSwapScript.ts';
@@ -30,6 +32,7 @@ export type { ClaimDetails, RefundDetails };
 export type { SighashMode } from './swap/Claim.ts';
 
 export {
+  BlockHeader,
   UnifiedSighash,
   Bip69,
   Musig,
@@ -50,6 +53,8 @@ export {
   fundingAddressTree,
   constructClaimTransaction,
   constructRefundTransaction,
+  cooperativeSighash,
+  cooperativeWitness,
   extractClaimPublicKeyFromSwapTree,
   extractRefundPublicKeyFromSwapTree,
   extractClaimPublicKeyFromReverseSwapTree,
