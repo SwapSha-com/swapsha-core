@@ -1,6 +1,6 @@
 {
   "name": "boltz-core",
-  "version": "5.0.0",
+  "version": "5.0.0-swapsha.2",
   "description": "Core library of Boltz",
   "type": "module",
   "main": "dist/lib/Boltz.js",
